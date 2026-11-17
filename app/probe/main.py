@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .config import Settings, load_settings
+from .connection import DeadlineReached
 from .dns_client import DnsResolver
 from .http_probe import Prober
 from .policy import PolicyError
@@ -76,6 +77,13 @@ class ProbeResponse(BaseModel):
     elapsed_ms: int = Field(..., description="整次探测耗时（毫秒）")
 
 
+class TimeoutResponse(BaseModel):
+    detail: dict = Field(
+        ...,
+        description="总超时信息：message、elapsed_ms，以及超时前已完成的逐跳信息",
+    )
+
+
 class PolicyResponse(BaseModel):
     allowed_cidrs: list[str]
     dns_server: str
@@ -101,6 +109,7 @@ prober = Prober(
     connect_timeout=settings.connect_timeout,
     read_timeout=settings.read_timeout,
     tls_timeout=settings.tls_timeout,
+    close_timeout=settings.close_timeout,
     max_redirects=settings.max_redirects,
 )
 _semaphore = asyncio.Semaphore(settings.max_concurrency)
@@ -143,13 +152,19 @@ async def get_policy() -> PolicyResponse:
             "connect": settings.connect_timeout,
             "tls": settings.tls_timeout,
             "read": settings.read_timeout,
+            "close": settings.close_timeout,
             "overall": settings.overall_timeout,
         },
     )
 
 
-@app.post("/api/v1/probe", response_model=ProbeResponse, tags=["probe"])
-async def create_probe(req: ProbeRequest) -> ProbeResponse:
+@app.post(
+    "/api/v1/probe",
+    response_model=ProbeResponse,
+    responses={408: {"model": TimeoutResponse}},
+    tags=["probe"],
+)
+async def create_probe(req: ProbeRequest):
     method = req.method.upper()
     if method not in ("GET", "HEAD"):
         raise HTTPException(status_code=422, detail="仅支持 GET/HEAD 方法")
@@ -165,21 +180,42 @@ async def create_probe(req: ProbeRequest) -> ProbeResponse:
             ),
         )
 
+    # 总时限（loop 时钟基准，与 Prober 内部一致）：探测的每个阶段连同
+    # 连接收尾都必须在该时限内有界完成。
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + settings.overall_timeout
     async with _semaphore:
         try:
+            # 外层再留 1s 防御性宽限：正常情况下 Prober 自身的 deadline
+            # 先生效并完成全部收尾；外层只兜底意外，绝不成为常态路径。
             hops = await asyncio.wait_for(
-                prober.probe(req.url, method=method),
-                timeout=settings.overall_timeout,
+                prober.probe(req.url, method=method, deadline=deadline),
+                timeout=settings.overall_timeout + 1.0,
             )
         except PolicyError as exc:
             # 入口级静态错误（如非法 URL）：未产生任何流量
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except asyncio.TimeoutError:
+        except DeadlineReached as exc:
+            # 真正的总超时：返回 408，并附带超时前已完成的逐跳信息。
+            # 走到这里时 Prober 已在内部完成连接收尾，名额随即归还。
             elapsed = int((time.monotonic() - started) * 1000)
+            partial = getattr(exc, "hops", None) or []
             raise HTTPException(
                 status_code=408,
                 detail={
                     "message": f"探测总超时（{settings.overall_timeout}s）",
+                    "elapsed_ms": elapsed,
+                    "hops": [HopReportModel(**asdict(h)).model_dump()
+                             for h in partial],
+                },
+            ) from None
+        except asyncio.TimeoutError:
+            # 仅防御性兜底：理论上内部 deadline 会先到达
+            elapsed = int((time.monotonic() - started) * 1000)
+            raise HTTPException(
+                status_code=408,
+                detail={
+                    "message": f"探测总超时（{settings.overall_timeout}s，外层兜底）",
                     "elapsed_ms": elapsed,
                 },
             ) from None

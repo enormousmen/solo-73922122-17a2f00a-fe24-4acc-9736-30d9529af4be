@@ -28,6 +28,7 @@ DEMO_NAMES = [
     "allowed.demo.test",
     "www.allowed.demo.test",
     "https.allowed.demo.test",
+    "noclose.allowed.demo.test",
     "redirect-ok.demo.test",
     "redirect-final.demo.test",
     "forbidden.demo.test",

@@ -76,6 +76,13 @@ probe_url "跳转链超过 3 次上限：第 5 跳未连接即拦截" \
   "http://loop1.demo.test${HPORT}/loop/1"
 switch_profile allowed
 
+# 5.1) 不回应 TLS 关闭的目标：正常返回 200，但不回 close_notify。
+#     探测端必须在 CLOSE_TIMEOUT 内强制收尾：结论保持 200/ok，
+#     不会被改报超时，旧连接也不会占用并发名额。
+NO_CLOSE_PORT="${NO_CLOSE_PORT:-9443}"
+probe_url "不回应 TLS 关闭的目标（结论仍为 200/ok，收尾有界不积累连接）" \
+  "https://noclose.allowed.demo.test:${NO_CLOSE_PORT}/"
+
 # 6) 仅 IPv4 / 入口校验
 probe_url "IPv6 字面量：拒绝" "http://[2001:db8::1]/"
 probe_url "非 HTTP(S) scheme：拒绝" "ftp://allowed.demo.test${HPORT}/"

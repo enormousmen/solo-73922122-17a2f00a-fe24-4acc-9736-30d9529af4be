@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
 from contextlib import asynccontextmanager
 
 import pytest
@@ -122,6 +121,7 @@ def client(monkeypatch, demo_certs):
         monkeypatch.setenv("CONNECT_TIMEOUT", "3.0")
         monkeypatch.setenv("READ_TIMEOUT", "5.0")
         monkeypatch.setenv("TLS_TIMEOUT", "5.0")
+        monkeypatch.setenv("CLOSE_TIMEOUT", "1.0")
         monkeypatch.setenv("PROBE_OVERALL_TIMEOUT", "15.0")
 
         import app.probe.config as config_mod
@@ -212,3 +212,109 @@ def test_probe_bad_method_422(client):
 def test_openapi_docs_available(client):
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
+
+
+class _SilentServer:
+    """接受连接与请求但永不响应的本地 HTTP 目标（用于总超时 408）。"""
+
+    def __init__(self) -> None:
+        self._server = None
+        self.port = 0
+
+    async def _handle(self, reader, writer):  # noqa: ANN001
+        try:
+            await reader.read(4096)
+        except OSError:
+            pass
+        await asyncio.sleep(30)
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        self._server.close()
+        await self._server.wait_closed()
+
+
+def test_probe_overall_timeout_returns_408_with_hops(client, monkeypatch):
+    # 总超时发生在读取中：必须返回 408，且名额在收尾后释放、可继续正常探测
+    import app.probe.main as main_mod
+
+    # Settings 为 frozen dataclass，用 object.__setattr__ 调整测试参数
+    object.__setattr__(main_mod.settings, "overall_timeout", 1.0)
+    monkeypatch.setattr(main_mod.prober, "_read_timeout", 30.0, raising=False)
+
+    # TestClient 在独立线程/循环跑应用；用其 portal 启动目标服务
+    portal = client.portal
+    silent = _SilentServer()
+    portal.call(silent.start)
+    client._dns.zones = {"api-silent.test": ["127.0.0.1"]}
+    try:
+        t0 = __import__("time").monotonic()
+        r = client.post(
+            "/api/v1/probe", json={"url": f"http://api-silent.test:{silent.port}/"}
+        )
+        elapsed = __import__("time").monotonic() - t0
+        assert r.status_code == 408
+        body = r.json()["detail"]
+        assert "总超时" in body["message"]
+        assert body["elapsed_ms"] >= 900
+        # 408 携带超时前的逐跳信息
+        assert body["hops"] and body["hops"][0]["request_sent"] is True
+        assert elapsed < 5.0  # 收尾有界，未被悬挂连接拖住
+    finally:
+        portal.call(silent.stop)
+
+
+def test_slot_released_after_timeout_followup_probe_works(client, monkeypatch):
+    import app.probe.main as main_mod
+
+    object.__setattr__(main_mod.settings, "overall_timeout", 1.0)
+    monkeypatch.setattr(main_mod.prober, "_read_timeout", 30.0, raising=False)
+    portal = client.portal
+    silent = _SilentServer()
+    portal.call(silent.start)
+    client._dns.zones = {
+        "api-silent2.test": ["127.0.0.1"],
+        "api-good.test": ["127.0.0.1"],
+    }
+    try:
+        r1 = client.post(
+            "/api/v1/probe",
+            json={"url": f"http://api-silent2.test:{silent.port}/"},
+        )
+        assert r1.status_code == 408
+        # 名额已随收尾释放：正常探测立即可用
+        port = client._http.port
+        r2 = client.post(
+            "/api/v1/probe", json={"url": f"http://api-good.test:{port}/"}
+        )
+        assert r2.status_code == 200
+        assert r2.json()["outcome"] == "ok"
+    finally:
+        portal.call(silent.stop)
+
+
+def test_full_concurrency_rejects_with_429(client, monkeypatch):
+    import app.probe.main as main_mod
+
+    # 直接占满信号量，制造满额（不改动 frozen settings）
+    sem = main_mod._semaphore
+    monkeypatch.setattr(sem, "_value", 0, raising=False)
+    r = client.post(
+        "/api/v1/probe", json={"url": "http://api-good.test/"}
+    )
+    assert r.status_code == 429
+    assert "并发" in r.json()["detail"]
+
+
+def test_healthz_always_available(client):
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/healthz").json()["status"] == "ok"
+
+
+def test_policy_reports_close_timeout(client):
+    body = client.get("/api/v1/policy").json()
+    assert "close" in body["timeouts"]
+    assert body["timeouts"]["overall"] > 0

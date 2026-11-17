@@ -55,11 +55,14 @@ services:
         condition: service_completed_successfully
 
   # 允许访问的目标：HTTP/8080 + HTTPS/8443
+  # 另在 9443 提供“不回应 TLS 关闭”的原始 TLS 目标（仅容器网络内可达）
   target-allowed:
     build: .
     command: ["python", "-m", "app.targets.server"]
     environment:
       CERT_DIR: /app/certs
+      TLS_NO_CLOSE_PORT: "9443"
+      TLS_NO_CLOSE_HOLD: "300"
     volumes:
       - certs:/app/certs:ro
     networks:
@@ -95,6 +98,7 @@ services:
       CONNECT_TIMEOUT: "5.0"
       TLS_TIMEOUT: "8.0"
       READ_TIMEOUT: "10.0"
+      CLOSE_TIMEOUT: "2.0"
       MAX_REDIRECTS: "3"
       MAX_CONCURRENCY: "64"
       PROBE_OVERALL_TIMEOUT: "30.0"

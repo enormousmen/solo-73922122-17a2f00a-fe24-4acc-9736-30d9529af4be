@@ -176,13 +176,121 @@ async def https_server(demo_certs) -> FakeHttpServer:
         await srv.stop()
 
 
+class TlsNoCloseServer:
+    """不回应 TLS 关闭的目标：正常返回 200 后保持连接、不回 close_notify。
+
+    用于回归“收尾必须有界、旧连接不得积累、已取得结论不得改报超时”。
+    ``active_handlers`` 暴露仍悬挂的服务端连接任务；探测端 abort 后，
+    服务端传输的 connection_lost 触发对应 disconnect 事件。
+    """
+
+    def __init__(self, ssl_ctx: ssl.SSLContext, hold_seconds: float = 30.0) -> None:
+        self._ssl_ctx = ssl_ctx
+        self._hold = hold_seconds
+        self._server: asyncio.base_events.Server | None = None
+        self.port = 0
+        self.active_handlers: set[asyncio.Task] = set()
+        # 每个连接对应一个“对端已断开”事件：探测端 abort 后触发
+        self.disconnect_events: list[asyncio.Event] = []
+
+    async def _handle(self, reader, writer) -> None:  # noqa: ANN001
+        task = asyncio.current_task()
+        self.active_handlers.add(task)
+        disconnected = asyncio.Event()
+        self.disconnect_events.append(disconnected)
+        response_sent = asyncio.Event()
+
+        # 在传输层挂钩 connection_lost（保留原方法，避免破坏 TLS 内部）
+        protocol = writer.transport.get_protocol()
+        original_conn_lost = protocol.connection_lost
+
+        def _on_conn_lost(exc) -> None:  # noqa: ANN001
+            try:
+                original_conn_lost(exc)
+            finally:
+                disconnected.set()
+
+        protocol.connection_lost = _on_conn_lost  # type: ignore[method-assign]
+
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = await reader.readline()
+                if not chunk:
+                    return
+                data += chunk
+            body = b'{"ok":true}'
+            head = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: keep-alive\r\n\r\n" + body
+            )
+            writer.write(head)
+            await writer.drain()
+            response_sent.set()
+            # 不主动关闭、不回应 close_notify；直到持有上限到期，或探测端
+            # abort 导致 connection_lost（disconnect 置位）才退出本 handler
+            hold_task = asyncio.create_task(asyncio.sleep(self._hold))
+            disc_task = asyncio.create_task(disconnected.wait())
+            try:
+                await asyncio.wait(
+                    {hold_task, disc_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                hold_task.cancel()
+                disc_task.cancel()
+                await asyncio.gather(
+                    hold_task, disc_task, return_exceptions=True
+                )
+        except (OSError, ssl.SSLError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            response_sent.set()
+            self.active_handlers.discard(task)
+            transport = writer.transport
+            if transport is not None and not transport.is_closing():
+                transport.abort()
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(
+            self._handle, "127.0.0.1", 0, ssl=self._ssl_ctx
+        )
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+        for task in list(self.active_handlers):
+            task.cancel()
+        if self.active_handlers:
+            await asyncio.wait_for(
+                asyncio.gather(*self.active_handlers, return_exceptions=True),
+                timeout=2.0,
+            )
+
+
+@pytest_asyncio.fixture()
+async def tls_no_close_server(demo_certs) -> TlsNoCloseServer:
+    certfile, keyfile, _cafile = demo_certs
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(certfile), str(keyfile))
+    srv = TlsNoCloseServer(ctx)
+    await srv.start()
+    try:
+        yield srv
+    finally:
+        await srv.stop()
+
+
 @pytest.fixture()
 def make_prober(fake_dns, demo_certs):
     """构造只允许 127.0.0.1/32 的 Prober 工厂。"""
     _cert, _key, cafile = demo_certs
 
     def _factory(allowed=("127.0.0.1/32",), max_redirects: int = 3,
-                 read_timeout: float = 5.0) -> Prober:
+                 read_timeout: float = 5.0, close_timeout: float = 1.0) -> Prober:
         settings = Settings(
             policy=AddressPolicy.from_cidrs(list(allowed)),
             dns_server="127.0.0.1",
@@ -193,6 +301,7 @@ def make_prober(fake_dns, demo_certs):
             connect_timeout=3.0,
             read_timeout=read_timeout,
             tls_timeout=5.0,
+            close_timeout=close_timeout,
             max_redirects=max_redirects,
             max_concurrency=8,
             overall_timeout=20.0,
@@ -205,6 +314,7 @@ def make_prober(fake_dns, demo_certs):
             connect_timeout=3.0,
             read_timeout=read_timeout,
             tls_timeout=5.0,
+            close_timeout=close_timeout,
             max_redirects=max_redirects,
         )
 

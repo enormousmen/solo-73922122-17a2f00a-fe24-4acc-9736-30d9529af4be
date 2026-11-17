@@ -33,6 +33,8 @@ URL 静态校验（不产生流量）
 | 被拒目标收不到探测请求 | 拒绝发生在任何 socket 创建之前；集成测试与目标访问日志双向验证 |
 | HTTPS 按原域名验证证书 | `check_hostname=True`、`CERT_REQUIRED`，SNI/校验均用原域名，无关闭开关 |
 | 慢探测不阻塞其他请求 | 全异步 + 单事件循环；并发信号量，满额立即返回 429；单请求总超时 |
+| 连接收尾有界、不积累旧连接 | 总时限贯穿 DNS/TCP/TLS/读取/**收尾**；对端不回应 TLS 关闭时在 `CLOSE_TIMEOUT` 内强制 `abort()`，返回结果/归还名额前连接与通信任务必须全部退出 |
+| 已取得结论不被关闭等待改报 | 响应按 `Content-Length` 读取即定论；收尾只释放资源。真正总超时才返回 408，单阶段读取超时仍是跳内 error |
 
 ## 目录结构
 
@@ -51,7 +53,8 @@ app/
   certinit/         生成演示 CA、服务器证书、合并 CA bundle
 dns-profiles/       DNS 场景：allowed / swapped / mixed / loop
 compose.yaml        一键启动的完整演示环境
-tests/              57 个测试（策略、DNS 协议、TLS、跳转、并发、API 全链路）
+docs/runbook.md     演示入口与操作手册（启动、/docs、修复点与手动验证）
+tests/              77 个测试（策略、DNS 协议、TLS、跳转、并发、截止与收尾、API 全链路）
 scripts/demo.sh     演示脚本
 ```
 
@@ -73,7 +76,8 @@ open http://127.0.0.1:8000/docs
 
 目标服务同时监听标准端口 `80/443`（供跳转 URL 直接使用）与演示端口
 `8080/8443`，HTTP 与 HTTPS 行为一致；可用环境变量
-`TARGET_HTTP_PORTS` / `TARGET_HTTPS_PORTS` 覆盖监听端口。
+`TARGET_HTTP_PORTS` / `TARGET_HTTPS_PORTS` 覆盖监听端口。允许目标还在
+`9443`（`TLS_NO_CLOSE_PORT`）提供不回应 TLS 关闭的演示端点。
 
 > probe 容器**同时接入** `net_denied`（路由层可达），但白名单不含该网段。
 > 这证明拦截来自应用层白名单策略，而不是网络隔离。
@@ -159,9 +163,10 @@ curl -X POST http://127.0.0.1:8053/profiles/switch \
 | `DNS_TIMEOUT` / `DNS_RETRIES` | 3.0 / 1 | DNS 单次超时与重试次数 |
 | `CA_BUNDLE` | 系统信任库 | 信任 CA 文件（演示环境为系统 CA + 演示 CA 合并） |
 | `CONNECT_TIMEOUT` / `TLS_TIMEOUT` / `READ_TIMEOUT` | 5 / 8 / 10 秒 | 各阶段超时 |
+| `CLOSE_TIMEOUT` | 2 秒 | 单条连接优雅关闭等待上限；对端不回应 TLS 关闭时超时即强制 abort，收尾同样受总时限约束 |
 | `MAX_REDIRECTS` | 3 | 跳转上限，仅允许 0..3 |
 | `MAX_CONCURRENCY` | 64 | 在飞探测并发上限，超出返回 429 |
-| `PROBE_OVERALL_TIMEOUT` | 30 | 单请求总超时，超时返回 408 |
+| `PROBE_OVERALL_TIMEOUT` | 30 | 单请求总超时（含连接收尾），真正超时返回 408 并附已完成逐跳信息 |
 
 ## 测试
 
@@ -170,9 +175,15 @@ pip install -r requirements.txt pytest pytest-asyncio
 pytest -q
 ```
 
-57 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
+77 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
 混合解析整体拒绝、检查后换址、跳转上限/跳禁区/非 HTTP 协议、HTTPS 证书
-主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层。
+主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、总超时 408 与
+名额释放、不回应 TLS 关闭目标的有界收尾与连接不积累、API 层。
+
+> 演示目标 `target-allowed` 还在 9443 端口提供一个“不回应 TLS 关闭”的
+> 原始 TLS 服务（域名 `noclose.allowed.demo.test`）：正常返回带
+> Content-Length 的 200 后保持连接、不回 close_notify，用于复现与回归
+> 连接收尾问题。详见 [`docs/runbook.md`](docs/runbook.md)。
 
 ## 设计边界与说明
 

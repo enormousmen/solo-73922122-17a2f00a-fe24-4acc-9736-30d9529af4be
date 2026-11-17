@@ -19,6 +19,7 @@ class Settings:
     connect_timeout: float
     read_timeout: float
     tls_timeout: float
+    close_timeout: float
     max_redirects: int
     max_concurrency: int
     overall_timeout: float
@@ -54,6 +55,7 @@ def load_settings() -> Settings:
         connect_timeout=float(os.getenv("CONNECT_TIMEOUT", "5.0")),
         read_timeout=float(os.getenv("READ_TIMEOUT", "10.0")),
         tls_timeout=float(os.getenv("TLS_TIMEOUT", "8.0")),
+        close_timeout=float(os.getenv("CLOSE_TIMEOUT", "2.0")),
         max_redirects=max_redirects,
         max_concurrency=int(os.getenv("MAX_CONCURRENCY", "64")),
         overall_timeout=float(os.getenv("PROBE_OVERALL_TIMEOUT", "30.0")),
